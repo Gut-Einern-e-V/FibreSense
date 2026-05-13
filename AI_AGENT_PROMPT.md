@@ -1,6 +1,6 @@
 # 🤖 FiberSense — AI Agent Prompt Set
 
-> Six independent prompts. Each generates one complete component.
+> Eight independent prompts. Each generates one complete component.
 > Start with Prompt 1, then 2. The rest are optional extensions.
 
 ---
@@ -520,6 +520,159 @@ Test sketch: examples/ads1256_pio_test/ads1256_pio_test.ino
 
 ---
 
+## PROMPT 6 — Optional microscope visual classifier (ESP32-S3)
+
+```
+Generate firmware for an optional ESP32-S3 microscope module for FiberSense v2.
+
+Hardware: Seeed XIAO ESP32S3 Sense
+  - ESP32-S3, dual-core, 240MHz, 8MB PSRAM
+  - OV2640 camera, MIPI CSI (built-in on XIAO ESP32S3 Sense)
+  - UART: TXD=GPIO43, RXD=GPIO44 (to RP2040 UART1)
+  - White LED ring: 4x 0402 LEDs on GPIO2 (HIGH = illumination on)
+  - Trigger input: GPIO4 (HIGH = capture one frame)
+
+════════════════════════
+PROTOCOL (UART, 115200 baud)
+════════════════════════
+
+  RP2040 → ESP32-S3: {"cmd":"capture"}\n
+  ESP32-S3 → RP2040: {"fiber":"Wool","confidence":0.82,"top3":[...]}\n
+  ESP32-S3 → RP2040: {"error":"no_frame"}\n  (if capture failed)
+
+  Timeout: 3 seconds. RP2040 shows "Visual: timeout" if no response.
+
+════════════════════════
+IMAGE CAPTURE
+════════════════════════
+
+  On trigger:
+    1. Turn on white LED ring (GPIO2 HIGH).
+    2. Wait 50ms (LED settle + camera auto-exposure).
+    3. Capture one JPEG frame at 320×240 resolution.
+    4. Turn off white LED ring.
+    5. Run inference.
+
+  Camera settings:
+    Resolution: 320×240 (FRAMESIZE_QVGA)
+    Format: JPEG quality 10 (for speed)
+    AEC: enabled (auto exposure)
+    AWB: enabled (auto white balance)
+
+════════════════════════
+INFERENCE
+════════════════════════
+
+  Model: MobileNetV2 INT8, trained on TextileNet-fibre (33 classes).
+  Store model as model.tflite in SPIFFS on XIAO ESP32S3.
+  Use TensorFlow Lite for Microcontrollers (tflite-micro).
+
+  Preprocessing:
+    1. Decode JPEG to RGB888 (320×240).
+    2. Center-crop to 224×224.
+    3. Normalise to float32 [-1, 1] range.
+    4. Input tensor shape: [1, 224, 224, 3].
+
+  Post-processing:
+    Softmax output, 33 classes (TextileNet fiber taxonomy).
+    Map to FiberSense class names:
+      "Cotton" → {TextileNet: "cotton_fibre"}
+      "Polyester" → {TextileNet: "polyester_fibre"}
+      "Wool" → {TextileNet: "wool_fibre"}
+      "Nylon" → {TextileNet: "nylon_fibre", "nylon_66_fibre"}
+      "Viscose" → {TextileNet: "viscose_fibre", "rayon_fibre"}
+      (Map remaining TextileNet classes to "Unknown" if no FiberSense equivalent)
+    Confidence = softmax probability of top class.
+    top3: top 3 mapped class names + probabilities.
+
+════════════════════════
+INTEGRATION WITH RP2040
+════════════════════════
+
+  RP2040 side (add to sensor_detect.cpp):
+    UART1 at GPIO0/GPIO1, 115200 baud.
+    bool visual_present = false;
+    Send {"cmd":"ping"}\n → if response {"status":"ok"} within 500ms: visual_present=true.
+    SensorMode: add COMBINED_VISUAL = COMBINED + visual_present.
+
+  main.cpp: after CLASSIFYING state:
+    If visual_present: send {"cmd":"capture"}\n to ESP32-S3.
+    Wait up to 3s for visual result.
+    Merge: if NIR confidence > 0.75 → show NIR result, visual result as footnote.
+           if NIR confidence < 0.6  → show both results, show "Low confidence" icon.
+           if both agree → show combined confidence (max of the two).
+           if they disagree → show "Uncertain" + both predictions.
+
+  display_round.cpp: add drawVisualResult(VisualResult& v):
+    Bottom quarter of display: "👁 Wool 82%" in small text.
+
+════════════════════════
+OUTPUT FILES
+════════════════════════
+
+  1. esp32s3/platformio.ini         (ESP32-S3, Arduino framework, TFLite-micro)
+  2. esp32s3/src/main.cpp           (UART protocol, capture, inference loop)
+  3. esp32s3/src/camera.h/.cpp      (OV2640 init, QVGA capture)
+  4. esp32s3/src/visual_classifier.h/.cpp  (TFLite inference, class mapping)
+  5. tools/train_visual/train_mobilenet.py  (PC training script: TextileNet → TFLite INT8)
+```
+
+---
+
+## PROMPT 7 — NIST NIR-SORT dataset converter
+
+```
+Generate tools/convert_nist_to_csv.py
+
+Converts NIST NIR-SORT spectra (continuous FT-NIR, ~900–2500nm) into synthetic 8-channel
+CSVs compatible with FiberSense Measure mode classifier.
+
+CLI:
+  python convert_nist_to_csv.py \
+    --input ./data/nist_nirsort/ \
+    --output ./data/reference_spectra/measure_mode/ \
+    --bias-correct ./data/reference_spectra/measure_mode/Cotton_100/
+
+Arguments:
+  --input      Directory containing NIST NIR-SORT CSV files (one per sample).
+               NIST format: two columns: "wavelength_nm", "reflectance".
+  --output     Output directory. Subdirectory per fiber class, one CSV per sample.
+  --bias-correct  Optional. Path to existing FiberSense reference CSVs for one class.
+               If provided, computes a per-channel additive bias correction between
+               the NIST-derived synthetic spectrum and the real device spectra for that
+               class, and applies it to all converted samples.
+
+FiberSense target wavelengths: [940, 1050, 1200, 1300, 1450, 1550, 1600, 1650]
+Extraction method: linear interpolation of continuous spectrum at each target wavelength.
+
+Behaviour:
+  1. Scan input directory for CSV files. Parse NIST class label from filename
+     (format: "NIST_NIRSORT_{class}_{sampleID}.csv" or similar — try both underscore
+     and hyphen patterns, prompt user if ambiguous).
+  2. Map NIST class names to FiberSense class names:
+       "cotton"    → Cotton_100
+       "polyester" → Polyester_100
+       "wool"      → Wool_100
+       "nylon"     → Nylon_PA6
+       "viscose"   → Viscose
+       Prompt user for any unmapped class names.
+  3. Interpolate reflectance at 8 target wavelengths.
+  4. Apply bias correction if --bias-correct provided:
+       bias[i] = mean(real_device[i]) - mean(nist_synthetic[i])  for matching class
+       corrected[i] = interpolated[i] + bias[i]
+  5. Save output CSV:
+       Header row: 940,1050,1200,1300,1450,1550,1600,1650
+       Data rows: one row per sample (all samples of a class in one file)
+       Filename: {class}_nist_{N}samples.csv
+  6. Print summary table:
+       Class | N samples | Mean reflectance per channel | Bias correction applied
+  7. Print: "Import complete. Copy output directory to SD card /ref/ to use."
+
+Requirements: numpy, pandas, scipy (for interpolation)
+```
+
+---
+
 ## CALIBRATION CONTEXT (append to any prompt involving calibration)
 
 ```
@@ -544,6 +697,23 @@ If current temperature deviates >5°C from calibration temperature:
 
 Recommended practice: recalibrate at start of each session.
 Calibration takes ~10 seconds total.
+
+COLOR & DYE CONTEXT:
+  Dark/black fabric reduces absolute NIR reflectance by 30–60%.
+  After two-point calibration the band shapes are preserved, but absolute values shift down.
+  The k-NN classifier in classifier.cpp should support two distance metrics:
+    1. Cosine distance (default): color-invariant, based on spectral shape only.
+    2. Euclidean distance (optional): absolute reflectance, useful for light samples only.
+  Always use cosine distance as the primary metric.
+
+  Low-signal detection: if mean(raw[i] for all i) < RAW_LOW_SIGNAL_THRESHOLD (config.h,
+  default 8192), set scan.low_signal=true. Display "Dark fabric" warning on result screen.
+  Do not block classification — warn only.
+
+  Color normalisation for AS7265x (Learn mode):
+    Before classification, normalise channels by L2 norm: v[i] = v[i] / sqrt(sum(v[j]^2))
+    This makes the classifier respond to spectral shape, not absolute intensity.
+    Store both raw and normalised vectors in ScanResult.
 ```
 
 ---

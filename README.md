@@ -395,21 +395,84 @@ for optional firmware embedding without SD card.
 
 ### Expected accuracy (Measure mode, starter library)
 
-| Fiber | Accuracy | Main diagnostic λ |
-|-------|----------|-------------------|
-| Cotton 100% | ~93% | 1450nm (O–H high) |
-| Polyester 100% | ~96% | 1200 + 1650nm (C–H high) |
-| Wool 100% | ~88% | 1450 + 1600nm (N–H protein) |
-| Nylon PA6/66 | ~85% | 1550 + 1600nm (N–H amide) |
-| Viscose/Lyocell | ~82% | Cotton-like spectrum |
-| Cotton/PET 50/50 | ~75% | Ratio 1450/1200nm |
-| Acrylic (PAN) | ✗ | Key band at 2240nm, outside G8370 range |
+Figures for light/pastel colored samples. Accuracy drops ~5–15% for very dark/black samples
+unless a color-stratified reference library is used (see Color & Dye Effects section below).
+
+| Fiber | Accuracy (light) | Accuracy (dark) | Main diagnostic λ |
+|-------|-----------------|-----------------|-------------------|
+| Cotton 100% | ~93% | ~80% | 1450nm (O–H high) |
+| Polyester 100% | ~96% | ~85% | 1200 + 1650nm (C–H high) |
+| Wool 100% | ~88% | ~78% | 1450 + 1600nm (N–H protein) |
+| Nylon PA6/66 | ~85% | ~75% | 1550 + 1600nm (N–H amide) |
+| Viscose/Lyocell | ~82% | ~72% | Cotton-like spectrum |
+| Cotton/PET 50/50 | ~75% | ~65% | Ratio 1450/1200nm |
+| Acrylic (PAN) | ✗ | ✗ | Key band at 2240nm, outside G8370 range |
 
 ---
 
-## Using the OpenTextile-NIR dataset
+## Color & Dye Effects on NIR Measurement
 
-Sormunen et al. (2026) released 71 labeled post-industrial samples.
+Textile color affects the two sensor modes very differently. Understanding this matters both
+for interpreting results and for building a representative reference library.
+
+### Learn mode (AS7265x, 410–940nm) — strongly affected
+
+This range covers most of the visible spectrum. Dye absorption peaks are directly in-band.
+A red polyester shirt and a white polyester shirt will produce noticeably different spectra
+in Learn mode — the color feature can dominate the fiber-type feature. This is partly
+intended: Learn mode is also used for color sorting. But it means the Learn mode classifier
+**must be trained with samples that span the color range of the target fabrics**.
+
+### Measure mode (ADS1256 + G8370-03, 940–1650nm) — partially affected
+
+Most textile dyes are transparent above ~900nm. The diagnostic fiber bands (O–H at 1450nm,
+C–H at 1200/1650nm, N–H at 1550–1600nm) are well above typical dye absorption ranges.
+
+**Exceptions that require extra care:**
+
+| Dye / colorant | Effect |
+|---|---|
+| Carbon black (black fabric) | Broadband NIR absorber; signal ~30–60% lower across all channels |
+| Indigo / vat dyes | Some absorption tail past 900nm; minor effect above 1000nm |
+| Reactive dyes (dark navy, deep red) | Generally transparent in the 1000–1650nm range |
+| Fluorescent whitening agents | Emission in UV/VIS only; no effect in NIR |
+
+**Practical impact:** A black cotton garment and a white cotton garment produce spectra with
+the same shape in Measure mode but different absolute reflectance values. After two-point
+calibration (which normalises to the white reference), the band ratios remain stable.
+Classification based on band ratios is robust to color. Absolute-reflectance k-NN can fail
+on very dark fabrics — the calibrated value may sit below the expected cluster.
+
+### Recommended mitigation strategies
+
+1. **Use band ratios as features** in the classifier instead of (or in addition to) absolute
+   reflectance. Key ratios: `R1450/R1200` (cotton vs. PET discriminator) and
+   `R1600/R1450` (wool/nylon vs. cotton). These are color-invariant in Measure mode.
+
+2. **Build color-stratified reference libraries.** For each fiber class, include at least:
+   light/pastel samples, mid-tone samples, and dark/black samples. The starter library in
+   `data/reference_spectra/` marks sample color in the CSV filename suffix:
+   `Cotton_100_light.csv`, `Cotton_100_dark.csv`.
+
+3. **Flag low-signal scans.** If the mean raw ADC value across all 8 LEDs is below a
+   threshold (e.g., `RAW_LOW_SIGNAL_THRESHOLD` in `config.h`, default 8192), display a
+   "Dark fabric — lower confidence" warning alongside the result. Do not block the scan.
+
+4. **AS7265x color normalisation.** For Learn mode, normalise each channel by the sum of
+   all channels before classification. This converts from "intensity × color × fiber" to
+   a color-shape feature that is partially color-invariant.
+
+5. **Collect NIST NIR-SORT dyed samples.** The NIST dataset (see below) includes both
+   undyed and dyed samples across multiple fiber types — use it to validate that your
+   classifier generalises across colors before deploying.
+
+---
+
+## Reference Datasets
+
+### OpenTextile-NIR (Sormunen et al., 2026)
+
+71 labeled post-industrial samples.
 DOI: [10.5281/zenodo.18269172](https://doi.org/10.5281/zenodo.18269172)
 
 The SWIR data (1000–2500nm) does not overlap with our sensor range and cannot be used
@@ -420,6 +483,147 @@ directly for calibration. What we can use:
   (11 of 71 samples were flagged as outliers — label errors from manufacturer data are real)
 
 Both files are included in `data/zenodo/` for reference.
+
+### NIST NIR-SORT (National Institute of Standards and Technology)
+
+The **Near-Infrared Spectra of Origin-defined and Real-world Textiles (NIR-SORT)** dataset
+from NIST covers 64 fabric types — pure fibers, blended fibers, and thrift-store real-world
+samples. Freely available from the NIST Public Data Repository:
+[https://data.nist.gov/od/id/mds2-3325](https://data.nist.gov/od/id/mds2-3325)
+
+Integration strategy:
+- NIR-SORT was collected on Fourier-transform NIR instruments with spectral range
+  typically 900–2500nm — much wider than our 8-channel LED array.
+- Extract the 8 wavelengths closest to our LED array (940, 1050, 1200, 1300, 1450, 1550,
+  1600, 1650nm) from the continuous NIR-SORT spectra to create **synthetic reference CSVs**
+  compatible with our classifier.
+- The tool `tools/convert_nist_to_csv.py` (see Prompt 7 in `AI_AGENT_PROMPT.md`) automates
+  this extraction.
+- Note: instrument-to-instrument calibration differences mean NIR-SORT synthetic CSVs may
+  need a small bias correction. Validate against at least 5 real device scans per class.
+- NIR-SORT includes dyed samples — ideal for building the color-stratified library above.
+
+### TextileNet (Zhong et al., 2023)
+
+[https://github.com/hahashu/TextileNet](https://github.com/hahashu/TextileNet)
+
+TextileNet is a visual microscope image dataset: 760,949 images across 33 fiber classes and
+27 fabric classes. It is **not** a spectral dataset and cannot be used directly with the NIR
+sensors. Its value for FiberSense is:
+
+- **Microscope module (v2.x roadmap):** TextileNet provides training data for an optional
+  visual fiber classifier running on the XIAO Microscope accessory (see below). Fiber
+  morphology features (twist direction, fiber diameter, surface scales) visible at 40–100×
+  magnification are distinct per fiber type and complement NIR spectral classification.
+- **Cross-modal validation:** When NIR confidence is low (< 0.6), a visual prediction from
+  the microscope can serve as a second opinion and be shown on the display.
+- **Workshop use:** Show participants microscope images alongside spectra. Wool scales vs.
+  polyester smoothness is immediately visible and motivates the multi-modal approach.
+
+Citation: Shu Zhong, Miriam Ribul, Youngjun Cho, Marianna Obrist,
+"TextileNet: A Material Taxonomy-based Fashion Textile Dataset", arXiv:2301.06160.
+
+---
+
+## Optional Microscope Module
+
+> **Status:** Roadmap item (v2.x). Not part of v1.0 hardware. Described here for planning.
+
+A compact digital microscope can be attached to the sensor hat as a **secondary analysis
+accessory**, providing visual fiber morphology identification to complement NIR spectral data.
+
+### Why this is useful
+
+NIR spectroscopy identifies fiber chemistry. Microscopy identifies fiber morphology. They
+are orthogonal: NIR can distinguish cotton from polyester on chemistry alone; microscopy can
+distinguish twisted staple fibers from continuous filaments, and can detect scales (wool),
+ribbon cross-sections (cotton), or smooth round cross-sections (synthetic). Together they
+provide ~2× more classification evidence.
+
+The specific value of microscopy:
+- **Viscose vs. Cotton:** NIR spectra are similar (both cellulosic, O–H dominated). Under
+  microscope: viscose has a smooth, striated cross-section; cotton is kidney-shaped/hollow.
+- **Black fabrics (low NIR SNR):** Visual morphology is unaffected by color — works where
+  NIR confidence drops.
+- **Blend detection:** A 10% wool / 90% cotton blend is nearly invisible in NIR but shows
+  wool scales next to cotton fibers under microscope.
+
+### Hardware: Seeed XIAO Microscope
+
+The [Seeed Studio XIAO Microscope](https://www.seeedstudio.com/XIAO-Microscope-p-5971.html)
+is a compact (~30mm diameter) OV5647 5MP camera module designed for close-focus imaging.
+
+Relevant specifications:
+- Sensor: OV5647, 1/4-inch CMOS, 5MP (2592×1944), 30fps at 1080p
+- Interface: MIPI CSI or USB output (depending on variant)
+- Focus distance: fixed at ~5–15mm from objective
+- Needs LED ring illumination at the target (transmissive or reflected light)
+
+**Integration approach for handheld use:**
+
+The device must remain handheld — users press it against clothing. A microscope module
+must therefore be:
+
+1. **Integrated into the sensor hat** — same 3D-printed shell, same contact geometry.
+   The microscope objective sits next to the NIR measurement aperture. When the user
+   presses the device against fabric, both sensors contact the sample simultaneously.
+   Sensor hat v2 adds a second aperture ~8mm from the NIR aperture.
+
+2. **Independently illuminated** — a white LED ring (4× 0402 white LEDs in sensor hat v2)
+   provides reflected-light illumination at the microscope aperture. NIR LEDs are off
+   during image capture to avoid cross-contamination.
+
+3. **Connected to an ESP32-S3** (not the RP2040) — the RP2040 has no native MIPI CSI
+   support and limited RAM for image buffers. Options:
+   - Add a small ESP32-S3 module to the sensor PCB v2. It handles camera, runs TFLite
+     Lite visual classifier, and reports result to RP2040 over UART.
+   - Use a XIAO ESP32S3 Sense (has OV2640 camera built-in, BLE, WiFi) as standalone
+     module clipped alongside the main body — connects via BLE or UART.
+   - Process images on PC via USB: stream frames over USB serial, classify on PC, echo
+     result back to device. Viable for workshop use, not for standalone field use.
+
+4. **Firmware integration on RP2040 side:**
+   - New `SensorMode`: `VISUAL` and `COMBINED_VISUAL`.
+   - RP2040 sends a trigger command to ESP32-S3 after NIR scan completes.
+   - ESP32-S3 captures one frame, runs MobileNetV2 classifier (TextileNet-trained,
+     INT8 quantised, ~300KB), returns `{"fiber":"Wool","confidence":0.82}` via UART.
+   - Display shows both results: NIR result (primary, large) + visual result (secondary,
+     small). If they agree: combined confidence shown. If they disagree: "Uncertain" with
+     both options shown.
+
+### Implications for the sensor hat design
+
+```
+Sensor hat v2 cross-section:
+  ┌─────────────────────────────────────────┐
+  │  NIR aperture    │  Microscope aperture  │
+  │  (existing)      │  (8mm adjacent)       │
+  │                  │                       │
+  │  45°/0° LED+det  │  OV5647 objective     │
+  │  unchanged       │  White LED ring       │
+  └─────────────────────────────────────────┘
+  Spring-loaded contact applies to both apertures.
+  Total footprint increase: ~12mm wider.
+  Still fits in the hand. Still pressed flat against fabric.
+```
+
+Key mechanical constraints:
+- Focal distance of OV5647 with macro lens is ~5–15mm. Chamber depth must be tuned.
+- Fabric must be held flat at the aperture — the existing spring-loaded flexure handles this.
+- Ambient light must be blocked for both apertures — extend the existing light-tight chamber.
+- Print sensor hat v2 in black PETG (unchanged material).
+
+### Power budget
+
+| Component | Current |
+|---|---|
+| OV5647 (active) | ~150mA |
+| White LED ring (4×) | ~80mA |
+| ESP32-S3 (inference) | ~80mA |
+| **Additional total** | ~310mA peak, ~120mA average |
+
+This fits within the Waveshare board's LiPo charger output (~500mA continuous). Visual
+scans are triggered only when the user presses the button — not continuously active.
 
 ---
 
@@ -454,8 +658,12 @@ via USB serial.
 **v1.0** — this repo. Measure + Learn mode, 6 fiber types, round display UI.
 
 **v1.1** — scan table arm (FreeCAD), foot pedal trigger (GPIO28 external), batch scan mode.
+Color-stratified reference library (light/dark variants per class). NIST NIR-SORT synthetic
+CSV import tool (`tools/convert_nist_to_csv.py`). Low-signal dark-fabric warning on display.
 
-**v2.0** — second detector daughterboard: Hamamatsu G9208-256W InGaAs array (1.1–2.15µm)
+**v2.0** — Optional microscope module: sensor hat v2 with OV5647 + ESP32-S3, visual fiber
+morphology classifier (MobileNetV2 INT8, TextileNet-trained). Combined NIR + visual result
+on display. Second detector daughterboard: Hamamatsu G9208-256W InGaAs array (1.1–2.15µm)
 for acrylic (2240nm C≡N band) and improved blend quantification. Expansion connector
 reserved on v1.0 sensor PCB.
 
@@ -470,5 +678,7 @@ reserved on v1.0 sensor PCB.
 **Based on:** reremeter by Armin Straller & Bernhard Gessler (GPL-3.0)
 https://github.com/arminstr/reremeter
 
-**Reference dataset:** Sormunen et al. (2026), OpenTextile-NIR,
-Data in Brief 65, 112559. DOI: 10.1016/j.dib.2026.112559
+**Reference datasets:**
+- Sormunen et al. (2026), OpenTextile-NIR, Data in Brief 65, 112559. DOI: 10.1016/j.dib.2026.112559
+- NIST NIR-SORT. National Institute of Standards and Technology. https://data.nist.gov/od/id/mds2-3325
+- Zhong et al. (2023), TextileNet: A Material Taxonomy-based Fashion Textile Dataset. arXiv:2301.06160. https://github.com/hahashu/TextileNet
